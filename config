@@ -8,6 +8,9 @@ case "$NGX_PLATFORM" in
     SunOS:*)
         CORE_LIBS="$CORE_LIBS -llber"
     ;;
+    Linux:*)
+        CORE_LIBS="$CORE_LIBS -llber"
+    ;;
 esac
 
 CFLAGS="$CFLAGS"
