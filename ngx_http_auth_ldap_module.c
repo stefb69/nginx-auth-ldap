@@ -68,6 +68,11 @@ typedef struct {
     ngx_http_complex_value_t require_valid_user_dn;
     ngx_flag_t satisfy_all;
 
+    ngx_str_t filter;
+    ngx_str_t loc_filter;
+    ngx_str_t dn;
+    ngx_str_t loc_dn;
+
     ngx_uint_t connections;
     ngx_queue_t free_connections;
     ngx_queue_t waiting_requests;
@@ -168,6 +173,8 @@ static char * ngx_http_auth_ldap_servers(ngx_conf_t *cf, ngx_command_t *cmd, voi
 static char * ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server);
 static char * ngx_http_auth_ldap_parse_require(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server);
 static char * ngx_http_auth_ldap_parse_satisfy(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server);
+static char * ngx_http_auth_ldap_parse_dn(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server);
+static char * ngx_http_auth_ldap_parse_filter(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server);
 static void * ngx_http_auth_ldap_create_main_conf(ngx_conf_t *cf);
 static char * ngx_http_auth_ldap_init_main_conf(ngx_conf_t *cf, void *parent);
 static void * ngx_http_auth_ldap_create_loc_conf(ngx_conf_t *);
@@ -527,6 +534,14 @@ ngx_http_auth_ldap_parse_url(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server
         return NGX_CONF_ERROR;
     }
 
+    server->dn.data = ngx_pcalloc(cf->pool, ngx_strlen(server->ludpp->lud_dn));
+    server->dn.len = ngx_strlen(server->ludpp->lud_dn);
+    ngx_sprintf(server->dn.data, "%s", server->ludpp->lud_dn);
+
+    server->filter.data = ngx_pcalloc(cf->pool, ngx_strlen(server->ludpp->lud_filter));
+    server->filter.len = ngx_strlen(server->ludpp->lud_filter);
+    ngx_sprintf(server->filter.data, "%s", server->ludpp->lud_filter);
+
     if (ngx_strcmp(server->ludpp->lud_scheme, "ldap") == 0) {
         return NGX_CONF_OK;
 #if (NGX_OPENSSL)
@@ -621,6 +636,58 @@ ngx_http_auth_ldap_parse_satisfy(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *se
     }
 
     ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "http_auth_ldap: Incorrect value for auth_ldap_satisfy");
+    return NGX_CONF_ERROR;
+}
+
+/**
+ * Parse "dn" conf parameter
+ */
+static char *
+ngx_http_auth_ldap_parse_dn(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server)
+{
+    ngx_str_t *value;
+    ngx_str_t testurl;
+    value = cf->args->elts;
+    
+    testurl.len = ngx_strlen(server->ludpp->lud_scheme) + sizeof("://") - 1 +
+      ngx_strlen(server->ludpp->lud_host) + sizeof(":65535") + 1 + value[1].len + 1 + server->filter.len;
+    testurl.data = ngx_palloc(cf->pool, testurl.len);
+    ngx_sprintf(testurl.data, "%s://%s:%d/%s?%s%Z", server->ludpp->lud_scheme, server->ludpp->lud_host, server->ludpp->lud_port, value[1].data, server->filter.data);
+
+    if (ldap_is_ldap_url((const char *) testurl.data )) {
+      server->loc_dn.data = ngx_pcalloc(cf->pool, value[1].len);
+      server->loc_dn.len = value[1].len;
+      ngx_sprintf(server->loc_dn.data, "%s%Z", value[1].data);
+      return NGX_CONF_OK;
+    }
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "http_auth_ldap: Incorrect value for auth_ldap_dn");
+    return NGX_CONF_ERROR;
+}
+
+/**
+ * Parse "filter" conf parameter
+ */
+static char *
+ngx_http_auth_ldap_parse_filter(ngx_conf_t *cf, ngx_http_auth_ldap_server_t *server)
+{
+    ngx_str_t *value;
+    ngx_str_t testurl;
+    value = cf->args->elts;
+    
+    testurl.len = ngx_strlen(server->ludpp->lud_scheme) + sizeof("://") - 1 +
+      ngx_strlen(server->ludpp->lud_host) + sizeof(":65535") + 1 + server->dn.len + 1 + value[1].len;
+    testurl.data = ngx_palloc(cf->pool, testurl.len );
+    ngx_sprintf(testurl.data, "%s://%s:%d/%s?%s%Z", server->ludpp->lud_scheme, server->ludpp->lud_host, server->ludpp->lud_port, server->dn.data, value[1].data);
+
+    if (ldap_is_ldap_url((const char *) testurl.data )) {
+      server->loc_filter.data = ngx_pcalloc(cf->pool, value[1].len);
+      server->loc_filter.len = value[1].len;
+      ngx_sprintf(server->loc_dn.data, "%s%Z", value[1].data);
+      return NGX_CONF_OK;
+    }
+
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "http_auth_ldap: Incorrect value for auth_ldap_filter");
     return NGX_CONF_ERROR;
 }
 
@@ -1777,20 +1844,27 @@ ngx_http_auth_ldap_search(ngx_http_request_t *r, ngx_http_auth_ldap_ctx_t *ctx)
         }
 
         ludpp = ctx->server->ludpp;
-        filter = ngx_pcalloc(
-            r->pool,
-            (ludpp->lud_filter != NULL ? ngx_strlen(ludpp->lud_filter) : ngx_strlen("(objectClass=*)")) +
-            ngx_strlen("(&(=))") + ngx_strlen(ludpp->lud_attrs[0]) + r->headers_in.user.len + 1);
-        ngx_sprintf(filter, "(&%s(%s=%V))%Z",
-                ludpp->lud_filter != NULL ? ludpp->lud_filter : "(objectClass=*)",
-                ludpp->lud_attrs[0], &r->headers_in.user);
-        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Search filter is \"%s\"",
-            (const char *) filter);
+	if (ctx->server->loc_filter.data != NULL) {
+	  filter = ngx_pcalloc(r->pool,
+			       ctx->server->loc_filter.len +
+			       ngx_strlen("(&(=))") + ngx_strlen(ludpp->lud_attrs[0]) + r->headers_in.user.len + 1);
+	  ngx_sprintf(filter, "(&%s(%s=%V))%Z", ctx->server->loc_filter.data,
+		      ludpp->lud_attrs[0], &r->headers_in.user);
+	} else {
+	  filter = ngx_pcalloc(r->pool,
+			       (ludpp->lud_filter != NULL ? ngx_strlen(ludpp->lud_filter) : ngx_strlen("(objectClass=*)")) +
+			       ngx_strlen("(&(=))") + ngx_strlen(ludpp->lud_attrs[0]) + r->headers_in.user.len + 1);
+	  ngx_sprintf(filter, "(&%s(%s=%V))%Z",
+		      ludpp->lud_filter != NULL ? ludpp->lud_filter : "(objectClass=*)",
+		      ludpp->lud_attrs[0], &r->headers_in.user);
+        }
+	ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "http_auth_ldap: Search filter is \"%s\"",
+		       (const char *) filter);
 
         attrs[0] = LDAP_NO_ATTRS;
         attrs[1] = NULL;
 
-        rc = ldap_search_ext(ctx->c->ld, ludpp->lud_dn, ludpp->lud_scope, (const char *) filter, attrs, 0, NULL, NULL, NULL, 0, &ctx->c->msgid);
+        rc = ldap_search_ext(ctx->c->ld, (ctx->server->loc_dn.data != NULL ? (const char *) ctx->server->loc_dn.data : ludpp->lud_dn), ludpp->lud_scope, (const char *) filter, attrs, 0, NULL, NULL, NULL, 0, &ctx->c->msgid);
         if (rc != LDAP_SUCCESS) {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "http_auth_ldap: ldap_search_ext() failed (%d, %s)",
                 rc, ldap_err2string(rc));
